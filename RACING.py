@@ -380,17 +380,23 @@ class SiecLAN:
         self.sock = None
         self.klienci = []
         self.gracze_zdalni = {}
+        self.koniec_wyscigu = None
+        self.wyscig_rozpoczety = False
         self.lock = threading.Lock()
         self.dane_toru = None
 
     def uruchom_hosta(self, port, dane_toru):
         self.czy_host = True
         self.aktywna = True
+        self.koniec_wyscigu = None
+        self.wyscig_rozpoczety = False
+        self.gracze_zdalni = {}
+        self.klienci = []
         self.dane_toru = dane_toru
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("0.0.0.0", port))
-        self.sock.listen(5)
+        self.sock.listen(30)
         threading.Thread(
             target=self._akceptuj_klientow,
             daemon=True
@@ -405,7 +411,12 @@ class SiecLAN:
                     "dane": self.dane_toru
                 }) + "\n"
                 conn.sendall(pakiet_mapa.encode("utf-8"))
-                self.klienci.append(conn)
+                with self.lock:
+                    self.klienci.append(conn)
+                    rozpoczety_teraz = self.wyscig_rozpoczety
+                if rozpoczety_teraz:
+                    pakiet_start = json.dumps({"typ": "START"}) + "\n"
+                    conn.sendall(pakiet_start.encode("utf-8"))
                 threading.Thread(
                     target=self._obsluz_klienta,
                     args=(conn,),
@@ -428,7 +439,29 @@ class SiecLAN:
                     if msg.get("typ") == "POZ":
                         with self.lock:
                             self.gracze_zdalni[msg["nick"]] = msg
-                        for k in list(self.klienci):
+                            klienci_kopia = list(self.klienci)
+                        for k in klienci_kopia:
+                            if k != conn:
+                                try:
+                                    k.sendall((linia + "\n").encode("utf-8"))
+                                except Exception:
+                                    pass
+                    elif msg.get("typ") == "START":
+                        with self.lock:
+                            self.wyscig_rozpoczety = True
+                            klienci_kopia = list(self.klienci)
+                        for k in klienci_kopia:
+                            if k != conn:
+                                try:
+                                    k.sendall((linia + "\n").encode("utf-8"))
+                                except Exception:
+                                    pass
+                    elif msg.get("typ") == "KONIEC":
+                        with self.lock:
+                            if self.koniec_wyscigu is None:
+                                self.koniec_wyscigu = msg
+                            klienci_kopia = list(self.klienci)
+                        for k in klienci_kopia:
                             if k != conn:
                                 try:
                                     k.sendall((linia + "\n").encode("utf-8"))
@@ -439,6 +472,9 @@ class SiecLAN:
 
     def polacz_jako_klient(self, ip, port):
         self.czy_host = False
+        self.koniec_wyscigu = None
+        self.wyscig_rozpoczety = False
+        self.gracze_zdalni = {}
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(5.0)
         self.sock.connect((ip, port))
@@ -470,10 +506,36 @@ class SiecLAN:
                     if msg.get("typ") == "POZ":
                         with self.lock:
                             self.gracze_zdalni[msg["nick"]] = msg
+                    elif msg.get("typ") == "START":
+                        with self.lock:
+                            self.wyscig_rozpoczety = True
+                    elif msg.get("typ") == "KONIEC":
+                        with self.lock:
+                            if self.koniec_wyscigu is None:
+                                self.koniec_wyscigu = msg
             except Exception:
                 break
 
-    def wyslij_pozycje(self, nick, x, y, kol_kod, postep):
+    def wyslij_start(self):
+        if not self.aktywna:
+            return
+        with self.lock:
+            self.wyscig_rozpoczety = True
+            klienci_kopia = list(self.klienci)
+        pakiet = (json.dumps({"typ": "START"}) + "\n").encode("utf-8")
+        if self.czy_host:
+            for k in klienci_kopia:
+                try:
+                    k.sendall(pakiet)
+                except Exception:
+                    pass
+        else:
+            try:
+                self.sock.sendall(pakiet)
+            except Exception:
+                pass
+
+    def wyslij_pozycje(self, nick, x, y, kol_kod, postep, okr=0):
         if not self.aktywna:
             return
         pakiet = json.dumps({
@@ -482,11 +544,37 @@ class SiecLAN:
             "x": round(x, 2),
             "y": round(y, 2),
             "kol": kol_kod,
-            "postep": round(postep, 2)
+            "postep": round(postep, 2),
+            "okr": int(okr)
         }) + "\n"
         dane = pakiet.encode("utf-8")
         if self.czy_host:
-            for k in list(self.klienci):
+            with self.lock:
+                klienci_kopia = list(self.klienci)
+            for k in klienci_kopia:
+                try:
+                    k.sendall(dane)
+                except Exception:
+                    pass
+        else:
+            try:
+                self.sock.sendall(dane)
+            except Exception:
+                pass
+
+    def wyslij_koniec(self, zwyciezca_nick, ranking):
+        if not self.aktywna:
+            return
+        pakiet = json.dumps({
+            "typ": "KONIEC",
+            "zwyciezca": zwyciezca_nick,
+            "ranking": ranking
+        }) + "\n"
+        dane = pakiet.encode("utf-8")
+        if self.czy_host:
+            with self.lock:
+                klienci_kopia = list(self.klienci)
+            for k in klienci_kopia:
                 try:
                     k.sendall(dane)
                 except Exception:
@@ -509,6 +597,7 @@ def wyczysc_ekran():
 def menu_glowne(baza):
     gracz = None
     wybrany_preset = "2"
+    liczba_okrazen_sp = 3
     siec = SiecLAN()
     while True:
         wyczysc_ekran()
@@ -569,10 +658,14 @@ def menu_glowne(baza):
         print(f"Gracz:  {nick_wysw}")
         print(f"Auto:   {skin_ansi}{skin_nazwa}{R}")
         print(f"Buffy:  Silnik Lv.{b_silnik}/3 | Opony Lv.{b_opony}/3")
-        print(f"Preset: {ZO}{PRESETY[wybrany_preset]['nazwa']}{R} (+{PRESETY[wybrany_preset]['nagroda']}$/okr.)")
+        print(
+            f"Preset: {ZO}{PRESETY[wybrany_preset]['nazwa']}{R} "
+            f"(+{PRESETY[wybrany_preset]['nagroda']}$/okr.) | "
+            f"SP Okr.: {CY}{liczba_okrazen_sp}{R}"
+        )
         print("----------------------------------------------")
         print("1. START WYŚCIGU (Singleplayer vs Boty)")
-        print("2. Zmień preset trudności")
+        print("2. Zmień preset trudności i okrążenia (SP: 1-10)")
         if gracz:
             print("3. Garaż i Sklep (Skiny oraz Buffy)")
             print("4. Multiplayer LAN (Postaw serwer / Dołącz)")
@@ -584,6 +677,7 @@ def menu_glowne(baza):
             return {
                 "gracz": gracz,
                 "preset": PRESETY[wybrany_preset],
+                "okrazenia_sp": liczba_okrazen_sp,
                 "skin_kod": skin_kod,
                 "skin_ansi": skin_ansi,
                 "vmax_mult": 1.0 + b_silnik * 0.015,
@@ -595,9 +689,24 @@ def menu_glowne(baza):
             print(f"{CY}--- WYBIERZ PRESET TRUDNOŚCI ---{R}\n")
             for k, p in PRESETY.items():
                 print(f"{k}. {p['nazwa']} - Nagroda za okrążenie: {ZL}{p['nagroda']}${R}")
-            pw = input("\nWybór: ").strip()
+            pw = input("\nWybór presetu (ENTER aby zachować obecny): ").strip()
             if pw in PRESETY:
                 wybrany_preset = pw
+
+            okr_raw = input(
+                f"\nLiczba okrążeń w singleplayerze (1-10, aktualnie {liczba_okrazen_sp}): "
+            ).strip()
+            if okr_raw:
+                try:
+                    okr_val = int(okr_raw)
+                    if 1 <= okr_val <= 10:
+                        liczba_okrazen_sp = okr_val
+                    else:
+                        print(f"{CZ}Podaj liczbę od 1 do 10! Pozostawiono {liczba_okrazen_sp}.{R}")
+                        time.sleep(1.0)
+                except ValueError:
+                    print(f"{CZ}Nieprawidłowa liczba! Pozostawiono {liczba_okrazen_sp}.{R}")
+                    time.sleep(1.0)
         elif wyb == "3" and gracz:
             while True:
                 gracz = baza.pobierz_gracza(gracz["nick"])
@@ -668,11 +777,43 @@ def menu_glowne(baza):
                 port = int(input("Port (domyślnie 5555): ").strip() or "5555")
                 dane_toru = generuj_tor(512)
                 siec.uruchom_hosta(port, dane_toru)
-                print(f"{ZI}Serwer nasłuchuje na porcie {port}! Uruchamiam wyścig...{R}")
-                time.sleep(1.0)
+                nick_host = gracz["nick"] if gracz else "Host"
+                while siec.aktywna and not siec.wyscig_rozpoczety:
+                    wyczysc_ekran()
+                    with siec.lock:
+                        zdalni_lista = list(siec.gracze_zdalni.keys())
+                        liczba_kl = len(siec.klienci)
+                    print(f"{CY}=============================================={R}")
+                    print(f"{BI}         POCZEKALNIA HOSTA (PORT {port})       {R}")
+                    print(f"{CY}=============================================={R}\n")
+                    print(f"Host: {ZI}{nick_host}{R}")
+                    print(f"Połączeni klienci: {ZO}{liczba_kl}{R}")
+                    if zdalni_lista:
+                        print("Gracze w pokoju:")
+                        for z_nick in zdalni_lista:
+                            print(f"  - {BI}{z_nick}{R}")
+                    else:
+                        print(f"{SZ}Oczekiwanie na dołączenie graczy...{R}")
+                    print("\nWciśnij ENTER, aby zatwierdzić i rozpocząć wyścig...")
+                    if os.name == 'nt':
+                        if msvcrt.kbhit():
+                            ch = msvcrt.getwch()
+                            if ch == "\r":
+                                siec.wyslij_start()
+                                break
+                        time.sleep(0.2)
+                    else:
+                        rlist, _, _ = select.select([sys.stdin], [], [], 0.3)
+                        if rlist:
+                            sys.stdin.readline()
+                            siec.wyslij_start()
+                            break
+                print(f"{ZI}Host zatwierdził start! Uruchamiam wyścig...{R}")
+                time.sleep(0.8)
                 return {
                     "gracz": gracz,
                     "preset": PRESETY[wybrany_preset],
+                    "okrazenia_sp": liczba_okrazen_sp,
                     "skin_kod": skin_kod,
                     "skin_ansi": skin_ansi,
                     "vmax_mult": 1.0 + b_silnik * 0.015,
@@ -684,11 +825,19 @@ def menu_glowne(baza):
                 port = int(input("Port (domyślnie 5555): ").strip() or "5555")
                 try:
                     siec.polacz_jako_klient(ip, port)
-                    print(f"{ZI}Połączono z serwerem!{R}")
-                    time.sleep(1.0)
+                    print(f"{ZI}Połączono z serwerem! Czekam na zatwierdzenie startu przez hosta...{R}")
+                    while siec.aktywna:
+                        with siec.lock:
+                            start_ok = siec.wyscig_rozpoczety
+                        if start_ok:
+                            break
+                        time.sleep(0.2)
+                    print(f"{ZI}Host rozpoczął wyścig!{R}")
+                    time.sleep(0.6)
                     return {
                         "gracz": gracz,
                         "preset": PRESETY[wybrany_preset],
+                        "okrazenia_sp": liczba_okrazen_sp,
                         "skin_kod": skin_kod,
                         "skin_ansi": skin_ansi,
                         "vmax_mult": 1.0 + b_silnik * 0.015,
@@ -744,8 +893,8 @@ def zaladuj_teksture_sciany(nazwa):
     try:
         obraz = Image.open(nazwa).convert("RGB")
         w, h = obraz.size
-        pix = obraz.load()
-        siatka = [[pix[x, y] for x in range(w)] for y in range(h)]
+        raw = list(obraz.getdata())
+        siatka = [raw[y * w:(y + 1) * w] for y in range(h)]
         return siatka, w, h
     except Exception:
         w, h = 32, 32
@@ -772,41 +921,40 @@ def zaladuj_teksture_sciany(nazwa):
         return siatka, w, h
 
 
-def renderuj_panorame(panorama, szerokosc, liczba_wierszy, kat):
-    """Rzutuje panoramę 360° na widok kamery, z zawijaniem poziomym."""
-    if panorama is None:
+def renderuj_panorame(dane_panoramy, szerokosc, liczba_wierszy, kat):
+    """Rzutuje panoramę 360° na widok kamery z wcześniej wczytanych pikseli."""
+    if dane_panoramy is None:
         return [[' '] * szerokosc for _ in range(liczba_wierszy)]
-    pw, ph = panorama.size
-    piksele = panorama.load()
+    piksele, pw, ph = dane_panoramy
     wysokosc_px = max(1, liczba_wierszy * 2)
     fov_h = math.radians(PANORAMA_FOV_H)
     fov_v = math.radians(PANORAMA_FOV_V)
     pitch = math.radians(PANORAMA_PITCH)
     offset = math.radians(PANORAMA_OFFSET)
     polowa_tan = math.tan(fov_h / 2.0)
-    wynik = []
+
+    katy_x = [
+        math.atan(((2.0 * (x + 0.5) / szerokosc) - 1.0) * polowa_tan)
+        for x in range(szerokosc)
+    ]
+    py_pary = []
     for y in range(liczba_wierszy):
+        indeks_gora = y * 2
+        indeks_dol = indeks_gora + 1
+        elewacja_gora = pitch + (0.5 - (indeks_gora + 0.5) / wysokosc_px) * fov_v
+        elewacja_dol = pitch + (0.5 - (indeks_dol + 0.5) / wysokosc_px) * fov_v
+        py_g = min(ph - 1, max(0, int((0.5 - elewacja_gora / math.pi) * ph))) * pw
+        py_d = min(ph - 1, max(0, int((0.5 - elewacja_dol / math.pi) * ph))) * pw
+        py_pary.append((py_g, py_d))
+
+    wynik = []
+    for py_g, py_d in py_pary:
         wiersz = []
-        for x in range(szerokosc):
-            ekran_x = (2.0 * (x + 0.5) / szerokosc) - 1.0
-            kat_x = math.atan(ekran_x * polowa_tan)
-            azymut = kat + offset + kat_x
-            px = int(((azymut / (2.0 * math.pi) + 0.5) % 1.0) * pw)
-            px = min(pw - 1, max(0, px))
-            indeks_gora = y * 2
-            indeks_dol = indeks_gora + 1
-            elewacja_gora = pitch + (
-                0.5 - (indeks_gora + 0.5) / wysokosc_px
-            ) * fov_v
-            elewacja_dol = pitch + (
-                0.5 - (indeks_dol + 0.5) / wysokosc_px
-            ) * fov_v
-            py_gora = int((0.5 - elewacja_gora / math.pi) * ph)
-            py_dol = int((0.5 - elewacja_dol / math.pi) * ph)
-            py_gora = min(ph - 1, max(0, py_gora))
-            py_dol = min(ph - 1, max(0, py_dol))
-            r1, g1, b1 = piksele[px, py_gora]
-            r2, g2, b2 = piksele[px, py_dol]
+        for kx in katy_x:
+            azymut = kat + offset + kx
+            px = min(pw - 1, max(0, int(((azymut / (2.0 * math.pi) + 0.5) % 1.0) * pw)))
+            r1, g1, b1 = piksele[py_g + px]
+            r2, g2, b2 = piksele[py_d + px]
             wiersz.append(
                 f"{ESC}[38;2;{r1};{g1};{b1}m"
                 f"{ESC}[48;2;{r2};{g2};{b2}m"
@@ -965,9 +1113,11 @@ def generuj_tor(rozmiar=512):
 # ============================================================
 
 def obroc(x, y, a):
+    c = math.cos(a)
+    s = math.sin(a)
     return (
-        x * math.cos(a) - y * math.sin(a),
-        x * math.sin(a) + y * math.cos(a)
+        x * c - y * s,
+        x * s + y * c
     )
 
 
@@ -1062,6 +1212,8 @@ def gra(baza, sesja):
     siec = sesja["siec"]
     gracz = sesja["gracz"]
     preset = sesja["preset"]
+    cel_okrazen_sp = sesja.get("okrazenia_sp", 3)
+    cel_okrazen_mp = 3
     kolor_gracza = sesja["skin_ansi"]
     nick_gracza = gracz["nick"] if gracz else f"Gosc_{random.randint(100, 999)}"
     dzwiek = Dzwiek()
@@ -1074,11 +1226,9 @@ def gra(baza, sesja):
     v = 0.0
     max_v = 0.46 * sesja["vmax_mult"]
     skr = 0.0
-    t0 = time.time()
     rek = gracz["rekord_czas"] if (gracz and gracz.get("rekord_czas")) else None
     komunikat_hud = ""
     komunikat_czas = 0.0
-    ostatnia_klatka = time.perf_counter()
     fps = 0.0
     z_dala = False
     vel_x, vel_y = 0.0, 0.0
@@ -1092,7 +1242,16 @@ def gra(baza, sesja):
     gracz_lap = 0
     gracz_idx = 0
     n_sc = len(sciezka)
+    zakonczony_mp = False
+    dane_konca_mp = None
+    zakonczony_sp = False
+    pozycja_koncowa_sp = 1
     panorama = zaladuj_panorame(PLIK_TLA)
+    dane_panoramy = (
+        (list(panorama.getdata()), panorama.width, panorama.height)
+        if panorama is not None
+        else None
+    )
     tex_sciana, tex_w, tex_h = zaladuj_teksture_sciany(PLIK_SCIANY)
     sys.stdout.write(f"{ESC}[?25l{ESC}[2J")
     dzwiek.start_muzyki()
@@ -1101,6 +1260,35 @@ def gra(baza, sesja):
         st = termios.tcgetattr(fd)
         tty.setcbreak(fd)
     try:
+        # ====================================================
+        # ODLICZANIE 3, 2, 1 PRZED STARTEM WYŚCIGU
+        # ====================================================
+        for etykieta_odl, kolor_odl in [("3", CZ), ("2", ZO), ("1", ZI), ("START!", CY)]:
+            t_odl = time.time()
+            while time.time() - t_odl < 0.75:
+                ekr_odl = [[' '] * W for _ in range(H)]
+                baza_odl = renderuj_panorame(dane_panoramy, W, H // 2, math.atan2(dy, dx))
+                for y_o, w_o in enumerate(baza_odl):
+                    ekr_odl[y_o] = w_o
+                for y_o in range(H // 2, H):
+                    for x_o in range(W):
+                        ekr_odl[y_o][x_o] = f"{SZ}.{R}"
+                napis = f"=== {etykieta_odl} ==="
+                sx_n = max(0, (W - len(napis)) // 2)
+                sy_n = H // 2 - 1
+                for idx_c, ch_c in enumerate(napis):
+                    if 0 <= sx_n + idx_c < W:
+                        ekr_odl[sy_n][sx_n + idx_c] = f"{kolor_odl}{ch_c}{R}"
+                buf_odl = ["+" + "-" * W + "+\n"]
+                buf_odl.extend("|" + "".join(w) + "|\n" for w in ekr_odl)
+                buf_odl.append("+" + "-" * W + "+\n")
+                sys.stdout.write(f"{ESC}[H" + "".join(buf_odl))
+                sys.stdout.flush()
+                time.sleep(0.05)
+
+        t0 = time.time()
+        ostatnia_klatka = time.perf_counter()
+
         while True:
             teraz = time.perf_counter()
             dt_klatki = teraz - ostatnia_klatka
@@ -1108,6 +1296,11 @@ def gra(baza, sesja):
             if dt_klatki > 0:
                 fps_chwilowy = 1.0 / dt_klatki
                 fps = fps_chwilowy if fps == 0 else fps * 0.85 + fps_chwilowy * 0.15
+                # Normalizacja delty do 30 FPS (bezpieczny clamp max 2.5)
+                dt_skala = min(max(dt_klatki * 30.0, 0.05), 2.5)
+            else:
+                dt_skala = 1.0
+
             kl = klawisze()
             if 'Q' in kl:
                 siec.aktywna = False
@@ -1164,7 +1357,7 @@ def gra(baza, sesja):
             pad_aktywny = time.time() < boost_pad_do
 
             # ====================================================
-            # NITRO + BOOST PAD
+            # NITRO + BOOST PAD (Z DELTA TIME)
             # ====================================================
             nitro_akt = (
                 'W' in kl and
@@ -1172,21 +1365,21 @@ def gra(baza, sesja):
                 nitro > 2.0
             )
             if nitro_akt:
-                nitro = max(0.0, nitro - 0.9)
+                nitro = max(0.0, nitro - 0.9 * dt_skala)
                 akt_max_v = max_v * 1.32
                 bonus_przysp = 1.75
                 dzwiek.sfx("nitro.wav", 0.65)
             elif pad_aktywny:
-                nitro = min(100.0, nitro + 0.22)
+                nitro = min(100.0, nitro + 0.22 * dt_skala)
                 akt_max_v = max_v * 1.26
                 bonus_przysp = 1.65
             else:
-                nitro = min(100.0, nitro + 0.22)
+                nitro = min(100.0, nitro + 0.22 * dt_skala)
                 akt_max_v = max_v
                 bonus_przysp = 1.0
 
             # ====================================================
-            # PRĘDKOŚĆ
+            # PRĘDKOŚĆ (Z DELTA TIME)
             # ====================================================
             ham = 'DOWN' in kl
             drift = (
@@ -1197,57 +1390,61 @@ def gra(baza, sesja):
                 if 'UP' in kl:
                     dzwiek.sfx("engine.wav", 0.45)
                 if v < 0:
-                    v = min(0.0, v + 0.008)
+                    v = min(0.0, v + 0.008 * dt_skala)
                 else:
                     v = min(
                         akt_max_v,
                         v + 0.0046 * bonus_przysp *
-                        (1.15 - (v / akt_max_v) * 0.7)
+                        (1.15 - (v / akt_max_v) * 0.7) * dt_skala
                     )
             elif ham:
                 if v > 0.004:
-                    v = max(0.0, v - 0.0075)
+                    v = max(0.0, v - 0.0075 * dt_skala)
                 else:
-                    v = max(-0.14, v - 0.003)
+                    v = max(-0.14, v - 0.003 * dt_skala)
             else:
                 if v > 0:
-                    v = max(0.0, v - 0.0018)
+                    v = max(0.0, v - 0.0018 * dt_skala)
                 else:
-                    v = min(0.0, v + 0.0022)
+                    v = min(0.0, v + 0.0022 * dt_skala)
             if drift:
-                v = max(0.0, v - 0.0025)
+                v = max(0.0, v - 0.0025 * dt_skala)
 
             # ====================================================
-            # SKRĘCANIE
+            # SKRĘCANIE (Z DELTA TIME)
             # ====================================================
             max_skr = 0.105 if drift else 0.080
             przyrost = 0.026 if drift else 0.019
             if 'LEFT' in kl and 'RIGHT' not in kl:
-                skr = max(skr - przyrost, -max_skr)
+                skr = max(skr - przyrost * dt_skala, -max_skr)
             elif 'RIGHT' in kl and 'LEFT' not in kl:
-                skr = min(skr + przyrost, max_skr)
+                skr = min(skr + przyrost * dt_skala, max_skr)
             else:
+                tlum_skr = 0.6 ** dt_skala
                 skr = (
                     0.0
-                    if abs(skr * 0.6) < 0.004
-                    else skr * 0.6
+                    if abs(skr * tlum_skr) < 0.004
+                    else skr * tlum_skr
                 )
             if abs(v) > 0.005 and skr != 0.0:
                 z = 1 if v > 0 else -1
-                dx, dy = obroc(dx, dy, skr * z)
-                px, py = obroc(px, py, skr * z)
+                dx, dy = obroc(dx, dy, skr * z * dt_skala)
+                px, py = obroc(px, py, skr * z * dt_skala)
 
             # ====================================================
-            # FIZYKA SAMOCHODU
+            # FIZYKA SAMOCHODU (Z DELTA TIME)
             # ====================================================
             bazowa_przyczepnosc = 0.07 if drift else 0.28
-            przyczepnosc = min(0.45, bazowa_przyczepnosc * sesja["grip_mult"])
+            przyczepnosc_baz = min(0.45, bazowa_przyczepnosc * sesja["grip_mult"])
+            przyczepnosc = 1.0 - ((1.0 - przyczepnosc_baz) ** dt_skala)
             vel_x += (dx * v - vel_x) * przyczepnosc
             vel_y += (dy * v - vel_y) * przyczepnosc
 
             # ====================================================
-            # RUCH BOTÓW AI (Z OBSŁUGĄ BOOST PADÓW '3')
+            # RUCH BOTÓW AI (Z DELTA TIME I BOOST PADAMI '3')
             # ====================================================
+            bot_lerp_v = 1.0 - ((1.0 - 0.15) ** dt_skala)
+            bot_lerp_k = 1.0 - ((1.0 - 0.86) ** dt_skala)
             for b in boty:
                 if MAPA[int(b['y'])][int(b['x'])] == '3':
                     b['boost_do'] = time.time() + 1.5
@@ -1273,8 +1470,8 @@ def gra(baza, sesja):
                 else:
                     kx = rx_b / dist_b
                     ky = ry_b / dist_b
-                    b['dx'] = b['dx'] * 0.86 + kx * 0.14
-                    b['dy'] = b['dy'] * 0.86 + ky * 0.14
+                    b['dx'] += (kx - b['dx']) * bot_lerp_k
+                    b['dy'] += (ky - b['dy']) * bot_lerp_k
                     dl_b = math.hypot(b['dx'], b['dy'])
                     b['dx'] /= dl_b
                     b['dy'] /= dl_b
@@ -1289,12 +1486,12 @@ def gra(baza, sesja):
                     )
                     b['vx'] += (
                         b['dx'] * cel_v - b['vx']
-                    ) * 0.15
+                    ) * bot_lerp_v
                     b['vy'] += (
                         b['dy'] * cel_v - b['vy']
-                    ) * 0.15
-                bnx = b['x'] + b['vx']
-                bny = b['y'] + b['vy']
+                    ) * bot_lerp_v
+                bnx = b['x'] + b['vx'] * dt_skala
+                bny = b['y'] + b['vy'] * dt_skala
                 if MAPA[int(b['y'])][int(bnx)] != '1':
                     b['x'] = bnx
                 else:
@@ -1361,10 +1558,10 @@ def gra(baza, sesja):
                         b2['y'] -= ny_k * nach
 
             # ====================================================
-            # RUCH GRACZA I ŚLIZGANIE PO BANDACH
+            # RUCH GRACZA I ŚLIZGANIE PO BANDACH (Z DELTA TIME)
             # ====================================================
-            nx = cx + vel_x
-            ny = cy + vel_y
+            nx = cx + vel_x * dt_skala
+            ny = cy + vel_y * dt_skala
             kol_x = MAPA[int(cy)][int(nx)] == '1'
             kol_y = MAPA[int(ny)][int(cx)] == '1'
             if not kol_x:
@@ -1425,20 +1622,55 @@ def gra(baza, sesja):
             wszystkie_postepy = [postep_gracza]
             for b in boty:
                 wszystkie_postepy.append(b['lap'] * n_sc + b['idx'])
+
             if siec.aktywna:
                 siec.wyslij_pozycje(
                     nick_gracza,
                     cx,
                     cy,
                     sesja["skin_kod"],
-                    postep_gracza
+                    postep_gracza,
+                    gracz_lap
                 )
+                uczestnicy_mp = [(nick_gracza, postep_gracza, gracz_lap)]
                 with siec.lock:
                     for g_lan in siec.gracze_zdalni.values():
                         wszystkie_postepy.append(g_lan.get("postep", 0.0))
+                        uczestnicy_mp.append((
+                            g_lan.get("nick", "Gracz"),
+                            g_lan.get("postep", 0.0),
+                            g_lan.get("okr", 0)
+                        ))
+                    if siec.koniec_wyscigu is not None:
+                        zakonczony_mp = True
+                        dane_konca_mp = siec.koniec_wyscigu
+
+                uczestnicy_mp.sort(key=lambda u: u[1], reverse=True)
+                lider_nick, _, lider_okr = uczestnicy_mp[0]
+                if not zakonczony_mp and lider_okr >= cel_okrazen_mp:
+                    ranking_list = [
+                        {"miejsce": idx + 1, "nick": u[0], "okr": u[2]}
+                        for idx, u in enumerate(uczestnicy_mp)
+                    ]
+                    dane_konca_mp = {
+                        "typ": "KONIEC",
+                        "zwyciezca": lider_nick,
+                        "ranking": ranking_list
+                    }
+                    siec.wyslij_koniec(lider_nick, ranking_list)
+                    zakonczony_mp = True
+
             wszystkie_postepy.sort(reverse=True)
             pozycja_w_wyscigu = wszystkie_postepy.index(postep_gracza) + 1
             liczba_aut = len(wszystkie_postepy)
+
+            if not siec.aktywna and gracz_lap >= cel_okrazen_sp:
+                zakonczony_sp = True
+                pozycja_koncowa_sp = pozycja_w_wyscigu
+                break
+
+            if siec.aktywna and zakonczony_mp:
+                break
 
             # ====================================================
             # CZAS OKRĄŻENIA I NAGRODY DO BAZY
@@ -1456,7 +1688,7 @@ def gra(baza, sesja):
                     rek = c
                     nowy_rek = True
                 if gracz:
-                    nagroda = preset["nagroda"]
+                    nagroda = max(1, preset["nagroda"] // pozycja_w_wyscigu)
                     if nowy_rek:
                         baza.wykonaj_update(
                             "UPDATE gracze SET kasa = kasa + ?, rekord_czas = ? WHERE id = ?",
@@ -1467,7 +1699,7 @@ def gra(baza, sesja):
                             "UPDATE gracze SET kasa = kasa + ? WHERE id = ?",
                             (nagroda, gracz["id"])
                         )
-                    komunikat_hud = f"+{nagroda}$ ZA OKRAZENIE!"
+                    komunikat_hud = f"+{nagroda}$ ZA OKRAZENIE ({pozycja_w_wyscigu}. MIEJSCE)!"
                 else:
                     komunikat_hud = f"OKRAZENIE: {c:.2f}s!"
                 komunikat_czas = time.time() + 3.5
@@ -1508,7 +1740,7 @@ def gra(baza, sesja):
             ekr = [[' '] * W for _ in range(H)]
             kat_kamery = math.atan2(vdy, vdx)
             baza_tla = renderuj_panorame(
-                panorama,
+                dane_panoramy,
                 W,
                 hor + 1,
                 kat_kamery
@@ -1812,7 +2044,9 @@ def gra(baza, sesja):
             kol_poz = ZL if pozycja_w_wyscigu == 1 else (
                 ZI if pozycja_w_wyscigu <= 3 else BI
             )
-            etykieta_poz = f"POZ: {pozycja_w_wyscigu}/{liczba_aut} | OKR: {gracz_lap + 1}"
+            max_okr_hud = cel_okrazen_mp if siec.aktywna else cel_okrazen_sp
+            akt_okr_hud = min(gracz_lap + 1, max_okr_hud)
+            etykieta_poz = f"POZ: {pozycja_w_wyscigu}/{liczba_aut} | OKR: {akt_okr_hud}/{max_okr_hud}"
             for i, ch in enumerate(etykieta_poz):
                 if 1 + i < W - 24:
                     ekr[1][1 + i] = f"{kol_poz}{ch}{R}"
@@ -1873,7 +2107,7 @@ def gra(baza, sesja):
                 f"{ESC}[H" + "".join(buf)
             )
             sys.stdout.flush()
-            time.sleep(0.03)
+            
     finally:
         dzwiek.stop_muzyki()
         sys.stdout.write(
@@ -1885,6 +2119,29 @@ def gra(baza, sesja):
                 termios.TCSADRAIN,
                 st
             )
+
+    if siec.aktywna and dane_konca_mp:
+        siec.aktywna = False
+        wyczysc_ekran()
+        print(f"{ZL}=============================================={R}")
+        print(f"{BI}     KONIEC WYŚCIGU MULTIPLAYER (3 OKR.)       {R}")
+        print(f"{ZL}=============================================={R}\n")
+        print(f"Zwycięzca: {ZI}{dane_konca_mp.get('zwyciezca', '-')}{R}\n")
+        for row in dane_konca_mp.get("ranking", []):
+            print(
+                f"  {row['miejsce']}. {BI}{row['nick']:<18}{R} "
+                f"- Okrążenia: {ZO}{row['okr']}/{cel_okrazen_mp}{R}"
+            )
+        input("\nWciśnij ENTER, aby wrócić do menu głównego...")
+    elif zakonczony_sp:
+        wyczysc_ekran()
+        print(f"{ZL}=============================================={R}")
+        print(f"{BI}     KONIEC WYŚCIGU SINGLEPLAYER ({cel_okrazen_sp} OKR.)    {R}")
+        print(f"{ZL}=============================================={R}\n")
+        print(f"Twój wynik: {ZI}{pozycja_koncowa_sp}. miejsce{R} z {liczba_aut} aut")
+        if rek is not None:
+            print(f"Najlepsze okrążenie: {CY}{rek:.2f}s{R}")
+        input("\nWciśnij ENTER, aby wrócić do menu głównego...")
 
 
 if __name__ == "__main__":
