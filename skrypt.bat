@@ -1,1 +1,1 @@
-python wyscigi.py
+python RACING.py
